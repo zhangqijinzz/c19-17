@@ -65,6 +65,20 @@ export interface PathPreview {
   toName: string;
 }
 
+export type PlacementIssueKind = 'channel' | 'overlap' | 'bounds';
+
+export interface PlacementConflict {
+  kind: PlacementIssueKind;
+  otherId: string | null;
+  message: string;
+}
+
+export interface PlacementBlock {
+  elementId: string;
+  relaxed: boolean;
+  conflicts: PlacementConflict[];
+}
+
 export interface Analysis {
   overlaps: OverlapIssue[];
   bounds: BoundsIssue[];

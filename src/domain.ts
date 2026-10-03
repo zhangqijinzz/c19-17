@@ -8,6 +8,7 @@ import type {
   FieldSize,
   LayoutDocument,
   PathPreview,
+  PlacementIssueKind,
   OverlapIssue,
 } from './types';
 
@@ -50,7 +51,9 @@ export const createElement = (kind: ElementKind, index: number, field: FieldSize
 
 export const normalizeRotation = (rotation: number): number => ((Math.round(rotation / 90) * 90) % 360 + 360) % 360;
 
-export const getBoundingBox = (element: ExpoElement) => {
+export interface Box { left: number; top: number; right: number; bottom: number; width: number; height: number; }
+
+export const getBoundingBox = (element: ExpoElement): Box => {
   const isQuarterTurn = normalizeRotation(element.rotation) % 180 !== 0;
   const width = isQuarterTurn ? element.height : element.width;
   const height = isQuarterTurn ? element.width : element.height;
@@ -60,16 +63,32 @@ export const getBoundingBox = (element: ExpoElement) => {
 const intersectionSize = (aStart: number, aEnd: number, bStart: number, bEnd: number) =>
   Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
 
+type PairRelation =
+  | { kind: 'overlap'; amount: number }
+  | { kind: 'channel'; gap: number }
+  | { kind: 'none' };
+
+// 两个 AABB 的唯一关系来源：重叠、窄通道（沿某一轴投影重叠、另一轴有间距）或无约束。
+// 事后分析与拖动时的落点判断都走这里，避免两套几何结论不一致。
+export const pairRelation = (first: Box, second: Box): PairRelation => {
+  const overlapX = intersectionSize(first.left, first.right, second.left, second.right);
+  const overlapY = intersectionSize(first.top, first.bottom, second.top, second.bottom);
+  if (overlapX > 0 && overlapY > 0) return { kind: 'overlap', amount: overlapX * overlapY };
+  const horizontalGap = first.right <= second.left ? second.left - first.right : second.right <= first.left ? first.left - second.right : 0;
+  const verticalGap = first.bottom <= second.top ? second.top - first.bottom : second.bottom <= first.top ? first.top - second.bottom : 0;
+  if (overlapY > 0 && horizontalGap > 0) return { kind: 'channel', gap: horizontalGap };
+  if (overlapX > 0 && verticalGap > 0) return { kind: 'channel', gap: verticalGap };
+  return { kind: 'none' };
+};
+
 export const findOverlaps = (elements: ExpoElement[]): OverlapIssue[] => {
   const issues: OverlapIssue[] = [];
   for (let i = 0; i < elements.length; i += 1) {
     const first = getBoundingBox(elements[i]);
     for (let j = i + 1; j < elements.length; j += 1) {
-      const second = getBoundingBox(elements[j]);
-      const overlapX = intersectionSize(first.left, first.right, second.left, second.right);
-      const overlapY = intersectionSize(first.top, first.bottom, second.top, second.bottom);
-      if (overlapX > 0 && overlapY > 0) {
-        issues.push({ firstId: elements[i].id, secondId: elements[j].id, amount: Number((overlapX * overlapY).toFixed(1)) });
+      const relation = pairRelation(first, getBoundingBox(elements[j]));
+      if (relation.kind === 'overlap') {
+        issues.push({ firstId: elements[i].id, secondId: elements[j].id, amount: Number(relation.amount.toFixed(1)) });
       }
     }
   }
@@ -78,27 +97,59 @@ export const findOverlaps = (elements: ExpoElement[]): OverlapIssue[] => {
 
 export const findBoundsIssues = (field: FieldSize, elements: ExpoElement[]): BoundsIssue[] =>
   elements.flatMap((element) => {
-    const box = getBoundingBox(element);
-    const overflow = Math.max(0, -box.left, -box.top, box.right - field.width, box.bottom - field.height);
+    const overflow = boundsOverflow(getBoundingBox(element), field);
     return overflow > 0 ? [{ elementId: element.id, overflow: Number(overflow.toFixed(1)) }] : [];
   });
+
+const boundsOverflow = (box: Box, field: FieldSize) =>
+  Math.max(0, -box.left, -box.top, box.right - field.width, box.bottom - field.height);
 
 export const findNarrowChannels = (elements: ExpoElement[]): ChannelIssue[] => {
   const issues: ChannelIssue[] = [];
   for (let i = 0; i < elements.length; i += 1) {
     const first = getBoundingBox(elements[i]);
     for (let j = i + 1; j < elements.length; j += 1) {
-      const second = getBoundingBox(elements[j]);
-      const verticalOverlap = intersectionSize(first.top, first.bottom, second.top, second.bottom);
-      const horizontalOverlap = intersectionSize(first.left, first.right, second.left, second.right);
-      const horizontalGap = first.right <= second.left ? second.left - first.right : second.right <= first.left ? first.left - second.right : 0;
-      const verticalGap = first.bottom <= second.top ? second.top - first.bottom : second.bottom <= first.top ? first.top - second.bottom : 0;
-      const gap = verticalOverlap > 0 ? horizontalGap : horizontalOverlap > 0 ? verticalGap : 0;
-      if (gap > 0 && gap < MIN_CHANNEL) issues.push({ firstId: elements[i].id, secondId: elements[j].id, gap: Number(gap.toFixed(1)) });
+      const relation = pairRelation(first, getBoundingBox(elements[j]));
+      if (relation.kind === 'channel' && relation.gap < MIN_CHANNEL) {
+        issues.push({ firstId: elements[i].id, secondId: elements[j].id, gap: Number(relation.gap.toFixed(1)) });
+      }
     }
   }
   return issues;
 };
+
+export interface PlacementIssue {
+  kind: PlacementIssueKind;
+  otherId: string | null;
+  gap?: number;
+  overflow?: number;
+  amount?: number;
+}
+
+// 评估某个候选元素（基于旋转后的实际占地 AABB）相对其余元素和场地边界的落点。
+// 返回的是候选落点自身引入/涉及的全部硬约束问题，是否允许落下由 view-model
+// 结合"当前位置已有问题"做新旧对比后决定。
+export const evaluatePlacement = (
+  candidate: ExpoElement,
+  others: ExpoElement[],
+  field: FieldSize,
+): PlacementIssue[] => {
+  const issues: PlacementIssue[] = [];
+  const candidateBox = getBoundingBox(candidate);
+  const overflow = boundsOverflow(candidateBox, field);
+  if (overflow > 0.05) issues.push({ kind: 'bounds', otherId: null, overflow: Number(overflow.toFixed(1)) });
+  others.forEach((other) => {
+    const relation = pairRelation(candidateBox, getBoundingBox(other));
+    if (relation.kind === 'overlap') issues.push({ kind: 'overlap', otherId: other.id, amount: Number(relation.amount.toFixed(1)) });
+    else if (relation.kind === 'channel') {
+      const gap = Number(relation.gap.toFixed(1));
+      if (gap < MIN_CHANNEL) issues.push({ kind: 'channel', otherId: other.id, gap });
+    }
+  });
+  return issues.sort((first, second) => issueRank[first.kind] - issueRank[second.kind]);
+};
+
+const issueRank: Record<PlacementIssueKind, number> = { channel: 0, overlap: 1, bounds: 2 };
 
 const distance = (first: { x: number; y: number }, second: { x: number; y: number }) => Math.hypot(second.x - first.x, second.y - first.y);
 
