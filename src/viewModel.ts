@@ -1,6 +1,6 @@
-import { createElement, createStarterDocument, analyzeLayout, findElement, getBoundingBox, normalizeRotation } from './domain';
+import { createElement, createStarterDocument, analyzeLayout, findElement, findPlacementBlockers, getBoundingBox, MIN_CHANNEL, normalizeRotation } from './domain';
 import type { LayoutRepository } from './repository';
-import type { Analysis, ElementKind, LayoutDocument, LayoutMode, Notice, RenderElement, ViewPhase } from './types';
+import type { Analysis, ChannelBlocker, ElementKind, ExpoElement, LayoutDocument, LayoutMode, Notice, RenderElement, ViewPhase } from './types';
 
 export interface ExpoSketchState {
   phase: ViewPhase;
@@ -11,6 +11,7 @@ export interface ExpoSketchState {
   mode: LayoutMode;
   analysis: Analysis;
   notice: Notice;
+  channelGuard: boolean;
   lastSavedAt: number | null;
 }
 
@@ -35,6 +36,7 @@ export class ExpoSketchViewModel {
     mode: 'edit',
     analysis: analyzeLayout(createStarterDocument()),
     notice: { tone: 'info', message: '正在恢复最近布局…' },
+    channelGuard: true,
     lastSavedAt: null,
   };
 
@@ -60,6 +62,17 @@ export class ExpoSketchViewModel {
 
   setMode(mode: LayoutMode) { this.commit({ mode, notice: { tone: 'info', message: mode === 'inspect' ? '检查模式已开启：拖动元素查看即时提示' : mode === 'path' ? '路径模式已开启：入口到重点区域的访问路线已生成' : '编辑模式已开启' } }); }
 
+  toggleChannelGuard() {
+    const channelGuard = !this.stateValue.channelGuard;
+    this.commit({
+      channelGuard,
+      notice: {
+        tone: 'info',
+        message: channelGuard ? `通道约束已开启：编辑模式拖动将守住 ≥ ${MIN_CHANNEL} m 的通道` : '通道约束已临时放开：可自由摆放，调整完记得恢复并检查',
+      },
+    });
+  }
+
   addElement(kind: ElementKind) {
     const element = createElement(kind, this.stateValue.document.elements.length, this.stateValue.document.field);
     const document = { ...this.stateValue.document, elements: [...this.stateValue.document.elements, element] };
@@ -74,8 +87,20 @@ export class ExpoSketchViewModel {
   }
 
   moveElement(id: string, x: number, y: number) {
-    const elements = this.stateValue.document.elements.map((element) => element.id === id ? { ...element, x: Number(x.toFixed(1)), y: Number(y.toFixed(1)) } : element);
-    this.commitAndPersist({ document: { ...this.stateValue.document, elements } });
+    const element = findElement(this.stateValue.document, id);
+    if (!element) return;
+    const candidate: ExpoElement = { ...element, x: Number(x.toFixed(1)), y: Number(y.toFixed(1)) };
+    if (this.isGuardActive()) {
+      const blockers = findPlacementBlockers(this.stateValue.document.elements, candidate);
+      if (blockers.length > 0) {
+        this.commit({ notice: { tone: 'warning', message: this.describeBlockers(candidate, blockers) } });
+        return;
+      }
+    }
+    const elements = this.stateValue.document.elements.map((item) => (item.id === id ? candidate : item));
+    const patch: Partial<ExpoSketchState> = { document: { ...this.stateValue.document, elements } };
+    if (this.stateValue.notice.tone === 'warning') patch.notice = { tone: 'info', message: '位置已更新，通道未受影响' };
+    this.commitAndPersist(patch);
   }
 
   resizeSelected(width: number, height: number) {
@@ -88,7 +113,17 @@ export class ExpoSketchViewModel {
   rotateSelected() {
     const id = this.stateValue.selectedId;
     if (!id) return;
-    const elements = this.stateValue.document.elements.map((element) => element.id === id ? { ...element, rotation: normalizeRotation(element.rotation + 90) } : element);
+    const element = findElement(this.stateValue.document, id);
+    if (!element) return;
+    const candidate: ExpoElement = { ...element, rotation: normalizeRotation(element.rotation + 90) };
+    if (this.isGuardActive()) {
+      const blockers = findPlacementBlockers(this.stateValue.document.elements, candidate);
+      if (blockers.length > 0) {
+        this.commit({ notice: { tone: 'warning', message: this.describeBlockers(candidate, blockers) } });
+        return;
+      }
+    }
+    const elements = this.stateValue.document.elements.map((item) => (item.id === id ? candidate : item));
     this.commitAndPersist({ document: { ...this.stateValue.document, elements }, notice: { tone: 'info', message: '方向已旋转 90°' } });
   }
 
@@ -117,6 +152,17 @@ export class ExpoSketchViewModel {
   private commitAndPersist(patch: Partial<ExpoSketchState>) {
     this.commit(patch);
     void this.persist();
+  }
+
+  private isGuardActive() {
+    return this.stateValue.channelGuard && this.stateValue.mode === 'edit';
+  }
+
+  private describeBlockers(candidate: ExpoElement, blockers: ChannelBlocker[]) {
+    const tightest = blockers.reduce((min, item) => (item.gap < min.gap ? item : min), blockers[0]);
+    const otherName = findElement(this.stateValue.document, tightest.otherId)?.name ?? '相邻元素';
+    const base = `已拦住：「${candidate.name}」与「${otherName}」之间通道将仅剩 ${tightest.gap} m（要求 ≥ ${MIN_CHANNEL} m）`;
+    return blockers.length > 1 ? `${base}，另有 ${blockers.length - 1} 处通道受限` : base;
   }
 
   private async persist() {

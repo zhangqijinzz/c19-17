@@ -1,6 +1,7 @@
 import type {
   Analysis,
   BoundsIssue,
+  ChannelBlocker,
   ChannelIssue,
   ElementKind,
   ElementSpec,
@@ -83,7 +84,7 @@ export const findBoundsIssues = (field: FieldSize, elements: ExpoElement[]): Bou
     return overflow > 0 ? [{ elementId: element.id, overflow: Number(overflow.toFixed(1)) }] : [];
   });
 
-export const findNarrowChannels = (elements: ExpoElement[]): ChannelIssue[] => {
+export const findNarrowChannels = (elements: ExpoElement[], minChannel = MIN_CHANNEL): ChannelIssue[] => {
   const issues: ChannelIssue[] = [];
   for (let i = 0; i < elements.length; i += 1) {
     const first = getBoundingBox(elements[i]);
@@ -94,10 +95,31 @@ export const findNarrowChannels = (elements: ExpoElement[]): ChannelIssue[] => {
       const horizontalGap = first.right <= second.left ? second.left - first.right : second.right <= first.left ? first.left - second.right : 0;
       const verticalGap = first.bottom <= second.top ? second.top - first.bottom : second.bottom <= first.top ? first.top - second.bottom : 0;
       const gap = verticalOverlap > 0 ? horizontalGap : horizontalOverlap > 0 ? verticalGap : 0;
-      if (gap > 0 && gap < MIN_CHANNEL) issues.push({ firstId: elements[i].id, secondId: elements[j].id, gap: Number(gap.toFixed(1)) });
+      if (gap > 0 && gap < minChannel) issues.push({ firstId: elements[i].id, secondId: elements[j].id, gap: Number(gap.toFixed(1)) });
     }
   }
   return issues;
+};
+
+const pairKey = (firstId: string, secondId: string) => [firstId, secondId].sort().join('|');
+
+/**
+ * 评估某个元素的候选摆法（移动或旋转后的状态）会新增哪些窄通道。
+ * 当前布局里已经有问题的元素对（窄通道或重叠）不算新增，
+ * 这样历史违规布局不会被锁死，随时可以把元素从错误位置挪出来。
+ * 占用范围统一走 getBoundingBox，旋转后的判断与渲染占地保持一致。
+ */
+export const findPlacementBlockers = (elements: ExpoElement[], candidate: ExpoElement, minChannel = MIN_CHANNEL): ChannelBlocker[] => {
+  const involvesCandidate = (issue: { firstId: string; secondId: string }) => issue.firstId === candidate.id || issue.secondId === candidate.id;
+  const existingPairs = new Set(
+    [...findNarrowChannels(elements, minChannel), ...findOverlaps(elements)]
+      .filter(involvesCandidate)
+      .map((issue) => pairKey(issue.firstId, issue.secondId)),
+  );
+  const nextElements = elements.map((element) => (element.id === candidate.id ? candidate : element));
+  return findNarrowChannels(nextElements, minChannel)
+    .filter((issue) => involvesCandidate(issue) && !existingPairs.has(pairKey(issue.firstId, issue.secondId)))
+    .map((issue) => ({ otherId: issue.firstId === candidate.id ? issue.secondId : issue.firstId, gap: issue.gap }));
 };
 
 const distance = (first: { x: number; y: number }, second: { x: number; y: number }) => Math.hypot(second.x - first.x, second.y - first.y);

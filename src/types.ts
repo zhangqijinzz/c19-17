@@ -58,6 +58,11 @@ export interface ChannelIssue {
   gap: number;
 }
 
+export interface ChannelBlocker {
+  otherId: string;
+  gap: number;
+}
+
 export interface PathPreview {
   points: Array<{ x: number; y: number }>;
   distance: number;
